@@ -1,0 +1,8 @@
+/env
+/.kilo
+challenge.md
+.env
+*.pyc
+__pycache__/
+conversations/*.mp3
+conversations/*.txt

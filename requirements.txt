@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+twilio==9.4.5
+openai==1.58.1
+python-dotenv==1.0.1
+pyngrok==7.2.2
+pydub==0.25.1
+websockets==14.1
+python-multipart==0.0.32
