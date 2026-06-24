@@ -113,20 +113,14 @@ async def stream_websocket(ws: WebSocket):
 
         _schedule_timeout()
 
-        await openai_client.send_response_create(
-            instructions_override=(
-                "Start the conversation with a natural greeting. "
-                "Do not describe yourself or ask how you can help yet — "
-                "just greet the patient briefly and naturally."
-            )
-        )
-
         twilio_audio_buffer = bytearray()
         openai_audio_buffer = bytearray()
         response_active = False
+        greeting_sent = False
+        stream_active = True
 
         async def twilio_to_openai():
-            nonlocal twilio_audio_buffer
+            nonlocal twilio_audio_buffer, greeting_sent
             try:
                 while True:
                     raw = await ws.receive_json()
@@ -137,8 +131,11 @@ async def stream_websocket(ws: WebSocket):
                         mu_law_chunk = base64.b64decode(payload_b64)
                         twilio_audio_buffer.extend(mu_law_chunk)
 
+                        if not greeting_sent:
+                            greeting_sent = True
+                            await openai_client.send_response_create()
+
                         try:
-                            # With audio/pcmu, forward µ-law bytes directly to OpenAI
                             await openai_client.send_audio(payload_b64)
                         except Exception as e:
                             logger.warning("Audio error (Twilio→OpenAI): %s", e)
@@ -153,6 +150,8 @@ async def stream_websocket(ws: WebSocket):
 
             except WebSocketDisconnect:
                 logger.info("Twilio WebSocket disconnected")
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
                 logger.warning("Error in twilio_to_openai: %s", e)
 
@@ -160,6 +159,9 @@ async def stream_websocket(ws: WebSocket):
             nonlocal openai_audio_buffer, response_active
             try:
                 async for event in openai_client.receive_events():
+                    if not stream_active:
+                        break
+
                     etype = event.get("type")
 
                     if etype == "response.output_audio.delta":
@@ -167,19 +169,17 @@ async def stream_websocket(ws: WebSocket):
                         mu_law_chunk = base64.b64decode(delta_b64)
                         openai_audio_buffer.extend(mu_law_chunk)
 
-                        try:
-                            # With audio/pcmu, forward µ-law bytes directly to Twilio
-                            await ws.send_json({
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": delta_b64},
-                            })
-                        except Exception as e:
-                            logger.warning("Audio error (OpenAI→Twilio): %s", e)
-                            continue
+                        if stream_active:
+                            try:
+                                await ws.send_json({
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": delta_b64},
+                                })
+                            except Exception:
+                                break
 
                         if state.recorder:
-                            # Convert µ-law to PCM16 for recording
                             state.recorder.add_bot_audio(ulaw_to_pcm16(mu_law_chunk))
 
                     elif etype == "conversation.item.input_audio_transcription.completed":
@@ -207,21 +207,38 @@ async def stream_websocket(ws: WebSocket):
                                 pass
 
                     elif etype == "error":
-                        # Suppress benign cancel-not-active errors from barge-in
                         error_code = event.get("error", {}).get("code", "")
                         if error_code == "response_cancel_not_active":
                             continue
                         logger.error("OpenAI Realtime API error: %s", event)
 
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
                 logger.warning("Error in openai_to_twilio: %s", e)
 
-        await asyncio.gather(twilio_to_openai(), openai_to_twilio())
+        twilio_task = asyncio.create_task(twilio_to_openai())
+        openai_task = asyncio.create_task(openai_to_twilio())
+
+        done, pending = await asyncio.wait(
+            [twilio_task, openai_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        stream_active = False
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     except asyncio.TimeoutError:
         logger.error("Timeout waiting for Twilio start event")
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
+    except asyncio.CancelledError:
+        pass  # server shutdown — handled in finally
     except Exception as e:
         logger.error("Stream error: %s", e)
     finally:

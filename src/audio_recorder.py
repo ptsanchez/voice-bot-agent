@@ -9,6 +9,10 @@ from pydub import AudioSegment
 AUDIO_SAMPLE_RATE = 8000
 AUDIO_SAMPLE_WIDTH = 2
 
+# Minimum gap (seconds) before we insert silence into the recording.
+# Audio chunks arrive every ~20ms, so anything >100ms is a real pause.
+_SILENCE_THRESHOLD_S = 0.1
+
 
 def ulaw_to_pcm16(mu_law_data: bytes) -> bytes:
     return audioop.ulaw2lin(mu_law_data, AUDIO_SAMPLE_WIDTH)
@@ -25,6 +29,12 @@ def resample_pcm16(data: bytes, from_rate: int, to_rate: int) -> bytes:
     return result
 
 
+def _silence_bytes(duration_s: float) -> bytes:
+    """Return silent PCM16 bytes for the given duration at AUDIO_SAMPLE_RATE."""
+    n_samples = int(duration_s * AUDIO_SAMPLE_RATE)
+    return b"\x00" * (n_samples * AUDIO_SAMPLE_WIDTH)
+
+
 class AudioRecorder:
     def __init__(self):
         self._agent_buffer = bytearray()
@@ -32,6 +42,8 @@ class AudioRecorder:
         self._transcripts: list[dict] = []
         self._lock = threading.Lock()
         self._start_time = time.monotonic()
+        self._last_agent_time: float | None = None
+        self._last_bot_time: float | None = None
 
     @property
     def start_time(self) -> float:
@@ -45,12 +57,24 @@ class AudioRecorder:
 
     def add_agent_audio(self, mu_law_data: bytes):
         pcm16 = ulaw_to_pcm16(mu_law_data)
+        now = time.monotonic()
         with self._lock:
+            if self._last_agent_time is not None:
+                gap = now - self._last_agent_time
+                if gap > _SILENCE_THRESHOLD_S:
+                    self._agent_buffer.extend(_silence_bytes(gap))
             self._agent_buffer.extend(pcm16)
+            self._last_agent_time = now
 
     def add_bot_audio(self, pcm16_data: bytes):
+        now = time.monotonic()
         with self._lock:
+            if self._last_bot_time is not None:
+                gap = now - self._last_bot_time
+                if gap > _SILENCE_THRESHOLD_S:
+                    self._bot_buffer.extend(_silence_bytes(gap))
             self._bot_buffer.extend(pcm16_data)
+            self._last_bot_time = now
 
     def add_transcript(self, speaker: str, text: str):
         ts = self._relative_timestamp()
